@@ -1,5 +1,6 @@
 # Frontend (Node.js / npm)
 frontend/node_modules/
+frontend/.vscode/
 frontend/dist/
 frontend/.env
 frontend/.env.local
