@@ -1,10 +1,12 @@
 package com.notion.backend.controllers;
 
 import com.notion.backend.dtos.ApiResponse;
+import com.notion.backend.dtos.request.BatchUpdateElementsRequest;
 import com.notion.backend.dtos.request.CreateElementsRequest;
 import com.notion.backend.dtos.request.DeleteElementsRequest;
 import com.notion.backend.dtos.request.UpdateElementRequest;
 import com.notion.backend.dtos.request.UpdateElementsRequest;
+import com.notion.backend.dtos.response.BatchUpdateElementsResponse;
 import com.notion.backend.dtos.response.DeleteElementsResponse;
 import com.notion.backend.dtos.response.ElementResponse;
 import com.notion.backend.services.ElementService;
@@ -96,6 +98,18 @@ public class ElementController {
         return ResponseEntity.ok(ApiResponse.<List<ElementResponse>>builder()
                 .success(true)
                 .message("Elements retrieved")
+                .data(response)
+                .build());
+    }
+
+    @PostMapping("/batch")
+    public ResponseEntity<ApiResponse<BatchUpdateElementsResponse>> batchUpdateElements(
+            @Valid @RequestBody BatchUpdateElementsRequest request
+    ) {
+        BatchUpdateElementsResponse response = elementService.batchUpdateElements(request);
+        return ResponseEntity.ok(ApiResponse.<BatchUpdateElementsResponse>builder()
+                .success(true)
+                .message("Elements batch updated")
                 .data(response)
                 .build());
     }

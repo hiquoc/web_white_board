@@ -1,5 +1,4 @@
-
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import CanvasActionButtons from './components/CanvasActionButtons'
 import CursorOverlay from './components/CursorOverlay'
 import FloatingToolbar from './components/FloatingToolbar'
@@ -7,6 +6,9 @@ import WhiteboardCanvas from './components/WhiteboardCanvas'
 import { useCamera } from './hooks/useCamera'
 import { useDrawingState } from './hooks/useDrawingState'
 import { useMouseCanvas } from './hooks/useMouseCanvas'
+import { createProject, getProject } from './apis/services/projectService'
+import { batchUpdateElements, createCreateOperation, createUpdateOperation, createDeleteOperation } from './apis/services/batchElementService'
+import { runDevSelfTest } from './apis/services/devSelfTest'
 import {
     DEFAULT_TEXT_FONT_SIZE,
     TEXT_LINE_HEIGHT_RATIO,
@@ -50,7 +52,7 @@ function App() {
     const suppressTextClickRef = useRef(false)
     const historyRef = useRef([])
     const historyIndexRef = useRef(-1)
-    const canvasRectRef= useRef(null)
+    const canvasRectRef = useRef(null)
     const panStateRef = useRef(null)
     const {
         currentStrokeRef,
@@ -77,6 +79,7 @@ function App() {
     })
 
     const [projectId, setProjectId] = useState(null);
+    const [userId, setUserId] = useState(null);
     const [zoomInput, setZoomInput] = useState('100')
 
     const [boardName, setBoardName] = useState('Sprint Planning Whiteboard')
@@ -102,7 +105,6 @@ function App() {
     const [editingText, setEditingText] = useState(null)
 
     const [historyIndex, setHistoryIndex] = useState(-1)
-    const [boardDirty, setBoardDirty] = useState(false)
 
     const currentToolRef = useRef('brush')
 
@@ -149,16 +151,70 @@ function App() {
         shouldUseFollowCursor
     })
 
+    // Refs for tracking element changes for auto-sync
+    const pendingElementChangesRef = useRef(new Map())
+    const autoSyncTimeoutRef = useRef(null)
+    const syncedElementsRef = useRef(new Map())
+    const isInitializedRef = useRef(false)
+
+    // DEV-ONLY: Run self-test on startup to verify backend integration
+    // useEffect(() => {
+    //     if (import.meta.env.DEV) {
+    //         runDevSelfTest()
+    //     }
+    // }, [])
+
+    const hasInit = useRef(false);
     useEffect(() => {
-        const projectId = new URLSearchParams(window.location.search).get('projectId')
-        if (projectId === null) {
-            const newProjectId = crypto.randomUUID()
-            window.history.replaceState(null, '', `?projectId=${newProjectId}`)
-            setProjectId(newProjectId)
+        if (hasInit.current) return;
+        hasInit.current = true;
+        const urlProjectId = new URLSearchParams(window.location.search).get('projectId')
+
+        // UUID validation regex (matches standard UUID format)
+        const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+        const isValidUuid = (id) => UUID_REGEX.test(id);
+
+        const initProject = async () => {
+            let finalProjectId = urlProjectId;
+
+            if (!finalProjectId || !isValidUuid(finalProjectId)) {
+                // Generate new UUID if missing or invalid
+                finalProjectId = crypto.randomUUID();
+                localStorage.setItem('projectId', finalProjectId);
+                window.history.replaceState(null, '', `?projectId=${finalProjectId}`);
+            }
+
+            setProjectId(finalProjectId);
+
+            try {
+                let response = await getProject(finalProjectId);
+
+                if (response.success && response.data) {
+                    setBoardName(response.data.title || boardName);
+                } else {
+                    await createProject({
+                        projectId: finalProjectId,
+                        title: boardName
+                    });
+                }
+            } catch (err) {
+                console.error('Init project failed:', err);
+            }
+
+            isInitializedRef.current = true;
+        };
+
+        const token = localStorage.getItem('token');
+        if (!token) {
+            setUserId(crypto.randomUUID());
         } else {
-            setProjectId(projectId)
+            const payload = JSON.parse(atob(token.split('.')[1]));
+            setUserId(payload.userId);
         }
-    }, [])
+
+        initProject();
+    }, []);
 
     useEffect(() => {
         currentToolRef.current = currentTool
@@ -341,6 +397,162 @@ function App() {
         hideToolCursor()
     }, [shouldUseFollowCursor])
 
+    // Element auto-sync: Send changes to backend after user stops interacting (debounced)
+    useEffect(() => {
+        if (!projectId || !userId || !isInitializedRef.current) return
+
+        // Clear existing timeout
+        if (autoSyncTimeoutRef.current) {
+            clearTimeout(autoSyncTimeoutRef.current)
+        }
+
+        // Debounce for 2.5 seconds after last change
+        autoSyncTimeoutRef.current = setTimeout(async () => {
+            try {
+                const currentStrokes = strokesRef.current
+                const currentShapes = shapesRef.current
+                const currentTexts = textsRef.current
+
+                // Build element operations based on changes
+                const operations = []
+                const currentElementIds = new Set()
+
+                // Process strokes
+                currentStrokes.forEach(stroke => {
+                    const id = stroke.id
+                    currentElementIds.add(id)
+                    const syncedVersion = syncedElementsRef.current.get(id)
+
+                    if (!syncedVersion) {
+                        // New element - create
+                        operations.push(createCreateOperation({
+                            userId,
+                            projectId,
+                            type: 'STROKE',
+                            data: { points: stroke.points || [] },
+                            style: { color: stroke.color, width: stroke.width, opacity: stroke.opacity || 1 },
+                            transform: {}
+                        }))
+                        // Override the generated id with the actual stroke id
+                        operations[operations.length - 1].id = id
+                    } else {
+                        // Existing element - check if changed
+                        operations.push(createUpdateOperation({
+                            id,
+                            userId,
+                            projectId,
+                            type: 'STROKE',
+                            data: { points: stroke.points || [] },
+                            style: { color: stroke.color, width: stroke.width, opacity: stroke.opacity || 1 },
+                            transform: {},
+                            version: syncedVersion
+                        }))
+                    }
+                })
+
+                // Process shapes
+                currentShapes.forEach(shapeItem => {
+                    const id = shapeItem.id
+                    currentElementIds.add(id)
+                    const syncedVersion = syncedElementsRef.current.get(id)
+
+                    if (!syncedVersion) {
+                        // New element - create
+                        operations.push(createCreateOperation({
+                            userId,
+                            projectId,
+                            type: shapeItem.type?.toUpperCase() || 'RECTANGLE',
+                            data: {},
+                            style: { color: shapeItem.color, strokeWidth: shapeItem.strokeWidth },
+                            transform: { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height }
+                        }))
+                        operations[operations.length - 1].id = id
+                    } else {
+                        // Existing element - update
+                        operations.push(createUpdateOperation({
+                            id,
+                            userId,
+                            projectId,
+                            type: shapeItem.type?.toUpperCase() || 'RECTANGLE',
+                            data: {},
+                            style: { color: shapeItem.color, strokeWidth: shapeItem.strokeWidth },
+                            transform: { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height },
+                            version: syncedVersion
+                        }))
+                    }
+                })
+
+                // Process texts
+                currentTexts.forEach(textItem => {
+                    const id = textItem.id
+                    currentElementIds.add(id)
+                    const syncedVersion = syncedElementsRef.current.get(id)
+
+                    if (!syncedVersion) {
+                        // New element - create
+                        operations.push(createCreateOperation({
+                            userId,
+                            projectId,
+                            type: 'TEXT',
+                            data: { text: textItem.text || '' },
+                            style: { color: textItem.color, fontSize: textItem.fontSize },
+                            transform: { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height }
+                        }))
+                        operations[operations.length - 1].id = id
+                    } else {
+                        // Existing element - update
+                        operations.push(createUpdateOperation({
+                            id,
+                            userId,
+                            projectId,
+                            type: 'TEXT',
+                            data: { text: textItem.text || '' },
+                            style: { color: textItem.color, fontSize: textItem.fontSize },
+                            transform: { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height },
+                            version: syncedVersion
+                        }))
+                    }
+                })
+
+                // Check for deleted elements
+                syncedElementsRef.current.forEach((version, id) => {
+                    if (!currentElementIds.has(id)) {
+                        // Element was deleted
+                        operations.push(createDeleteOperation({
+                            id,
+                            userId,
+                            projectId,
+                            type: 'UNKNOWN',
+                            version: version
+                        }))
+                        syncedElementsRef.current.delete(id)
+                    }
+                })
+
+                if (operations.length === 0) return
+
+                const response = await batchUpdateElements(projectId, operations)
+
+                if (response.success && response.data) {
+                    // Update synced versions for created/updated elements
+                    if (response.data.elements) {
+                        response.data.elements.forEach(element => {
+                            syncedElementsRef.current.set(element.id, element.version)
+                        })
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to sync elements:', err)
+            }
+        }, 2500)
+
+        return () => {
+            if (autoSyncTimeoutRef.current) {
+                clearTimeout(autoSyncTimeoutRef.current)
+            }
+        }
+    }, [strokes, shapes, texts, projectId, userId])
+
     function normalizeLayerOrder(nextStrokes, nextShapes, nextTexts, nextLayerOrder = layerOrderRef.current) {
         const strokeIds = new Set(nextStrokes.map(stroke => stroke.id))
         const shapeIds = new Set(nextShapes.map(shapeItem => shapeItem.id))
@@ -396,7 +608,6 @@ function App() {
         historyRef.current = trimmedHistory
         historyIndexRef.current = trimmedHistory.length - 1
         setHistoryIndex(trimmedHistory.length - 1)
-        setBoardDirty(trimmedHistory.length > 1)
     }
 
     function applyBoardState(nextStrokes, nextShapes, nextTexts, options = {}) {
@@ -443,7 +654,6 @@ function App() {
         setEditingText(null)
         setSelectedTextId(null)
         setSelectedShapeId(null)
-        setBoardDirty(nextIndex > 0)
     }
 
     function redo() {
@@ -468,7 +678,6 @@ function App() {
         setEditingText(null)
         setSelectedTextId(null)
         setSelectedShapeId(null)
-        setBoardDirty(nextIndex > 0)
     }
 
     function resizeCanvas() {

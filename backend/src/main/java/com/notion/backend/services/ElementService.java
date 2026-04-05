@@ -1,9 +1,12 @@
 package com.notion.backend.services;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.notion.backend.dtos.request.BatchElementOperationRequest;
+import com.notion.backend.dtos.request.BatchUpdateElementsRequest;
 import com.notion.backend.dtos.request.CreateElementRequest;
 import com.notion.backend.dtos.request.UpdateElementBatchItemRequest;
 import com.notion.backend.dtos.request.UpdateElementRequest;
+import com.notion.backend.dtos.response.BatchUpdateElementsResponse;
 import com.notion.backend.dtos.response.DeleteElementsResponse;
 import com.notion.backend.dtos.response.ElementResponse;
 import com.notion.backend.enums.ElementType;
@@ -81,6 +84,65 @@ public class ElementService {
         elementRepository.saveAll(elements);
         return DeleteElementsResponse.builder()
                 .deletedIds(ids)
+                .build();
+    }
+
+    @Transactional
+    public BatchUpdateElementsResponse batchUpdateElements(BatchUpdateElementsRequest request) {
+        List<UUID> createdIds = new java.util.ArrayList<>();
+        List<UUID> updatedIds = new java.util.ArrayList<>();
+        List<UUID> deletedIds = new java.util.ArrayList<>();
+        List<ElementResponse> elementResponses = new java.util.ArrayList<>();
+        
+        // Verify project exists
+        projectService.getProjectEntity(request.getProjectId());
+        
+        // Process each operation
+        for (BatchElementOperationRequest operation : request.getElements()) {
+            switch (operation.getUpdateType()) {
+                case CREATE -> {
+                    Element element = toEntityFromBatchOperation(operation);
+                    Element savedElement = elementRepository.save(element);
+                    createdIds.add(savedElement.getId());
+                    elementResponses.add(toResponse(savedElement));
+                }
+                case UPDATE -> {
+                    Element element = getActiveElement(operation.getId());
+                    applyUpdate(element, operation.getProjectId(), operation.getUserId(), 
+                            operation.getType(), operation.getData(), operation.getStyle(), 
+                            operation.getTransform());
+                    Element savedElement = elementRepository.save(element);
+                    updatedIds.add(savedElement.getId());
+                    elementResponses.add(toResponse(savedElement));
+                }
+                case DELETE -> {
+                    Element element = getActiveElement(operation.getId());
+                    element.setDeletedAt(Instant.now());
+                    elementRepository.save(element);
+                    deletedIds.add(element.getId());
+                }
+            }
+        }
+        
+        return BatchUpdateElementsResponse.builder()
+                .createdIds(createdIds)
+                .updatedIds(updatedIds)
+                .deletedIds(deletedIds)
+                .elements(elementResponses)
+                .build();
+    }
+    
+    private Element toEntityFromBatchOperation(BatchElementOperationRequest request) {
+        Project project = projectService.getProjectEntity(request.getProjectId());
+        
+        return Element.builder()
+                .id(request.getId() != null ? request.getId() : UUID.randomUUID())
+                .project(project)
+                .userId(request.getUserId() != null ? request.getUserId() : UUID.randomUUID())
+                .type(request.getType())
+                .data(request.getData())
+                .style(request.getStyle())
+                .transform(request.getTransform())
                 .build();
     }
 

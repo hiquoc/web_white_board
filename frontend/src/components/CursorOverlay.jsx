@@ -44,7 +44,7 @@ export default function CursorOverlay({
                     }}
                 />
             ) : CursorIcon ? (
-                <CursorIcon className="h-5 w-5 text-slate-900" strokeWidth={2} />
+                <CursorIcon className={`h-5 w-5 ${currentTool === 'text' && 'mt-10'} text-slate-900`} strokeWidth={2} />
             ) : null}
         </div>
     )

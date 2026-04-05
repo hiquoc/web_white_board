@@ -36,9 +36,18 @@ public class ProjectService {
                 .build();
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public ProjectResponse getProject(UUID id) {
-        return toResponse(getProjectEntity(id));
+        Project project = projectRepository.findById(id)
+                .orElseGet(() -> {
+                    // Auto-create project if it doesn't exist
+                    Project newProject = Project.builder()
+                            .id(id)
+                            .title(DEFAULT_TITLE)
+                            .build();
+                    return projectRepository.save(newProject);
+                });
+        return toResponse(project);
     }
 
     @Transactional(readOnly = true)
