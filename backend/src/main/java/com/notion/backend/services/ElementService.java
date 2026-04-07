@@ -1,6 +1,7 @@
 package com.notion.backend.services;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.notion.backend.dtos.request.BatchElementOperationRequest;
 import com.notion.backend.dtos.request.BatchUpdateElementsRequest;
 import com.notion.backend.dtos.request.CreateElementRequest;
@@ -27,6 +28,7 @@ import java.util.UUID;
 public class ElementService {
     private final ElementRepository elementRepository;
     private final ProjectService projectService;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Transactional
     public List<ElementResponse> createElements(List<CreateElementRequest> requests) {
@@ -43,7 +45,7 @@ public class ElementService {
     public ElementResponse updateElement(UUID id, UpdateElementRequest request) {
         Element element = getActiveElement(id);
         applyUpdate(element, request.getProjectId(), request.getUserId(), request.getType(),
-                request.getData(), request.getStyle(), request.getTransform());
+                toJsonString(request.getData()), toJsonString(request.getStyle()), toJsonString(request.getTransform()));
         return toResponse(elementRepository.save(element));
     }
 
@@ -53,7 +55,7 @@ public class ElementService {
                 .map(request -> {
                     Element element = getActiveElement(request.getId());
                     applyUpdate(element, request.getProjectId(), request.getUserId(), request.getType(),
-                            request.getData(), request.getStyle(), request.getTransform());
+                            toJsonString(request.getData()), toJsonString(request.getStyle()), toJsonString(request.getTransform()));
                     return element;
                 })
                 .toList();
@@ -108,9 +110,14 @@ public class ElementService {
                 }
                 case UPDATE -> {
                     Element element = getActiveElement(operation.getId());
+                    // Convert Map<String, Object> to JSON String for storage
+                    String dataStr = toJsonString(operation.getData());
+                    String styleStr = toJsonString(operation.getStyle());
+                    String transformStr = operation.getTransform() == null || operation.getTransform().isEmpty()
+                            ? "{}"
+                            : toJsonString(operation.getTransform());
                     applyUpdate(element, operation.getProjectId(), operation.getUserId(), 
-                            operation.getType(), operation.getData(), operation.getStyle(), 
-                            operation.getTransform());
+                            operation.getType(), dataStr, styleStr, transformStr);
                     Element savedElement = elementRepository.save(element);
                     updatedIds.add(savedElement.getId());
                     elementResponses.add(toResponse(savedElement));
@@ -135,14 +142,21 @@ public class ElementService {
     private Element toEntityFromBatchOperation(BatchElementOperationRequest request) {
         Project project = projectService.getProjectEntity(request.getProjectId());
         
+        // Convert Map<String, Object> to JSON String for storage
+        String dataStr = toJsonString(request.getData());
+        String styleStr = toJsonString(request.getStyle());
+        String transformStr = request.getTransform() == null || request.getTransform().isEmpty()
+                ? "{}"
+                : toJsonString(request.getTransform());
+        
         return Element.builder()
                 .id(request.getId() != null ? request.getId() : UUID.randomUUID())
                 .project(project)
                 .userId(request.getUserId() != null ? request.getUserId() : UUID.randomUUID())
                 .type(request.getType())
-                .data(request.getData())
-                .style(request.getStyle())
-                .transform(request.getTransform())
+                .data(dataStr)
+                .style(styleStr)
+                .transform(transformStr)
                 .build();
     }
 
@@ -162,10 +176,22 @@ public class ElementService {
                 .project(project)
                 .userId(request.getUserId() != null ? request.getUserId() : UUID.randomUUID())
                 .type(request.getType())
-                .data(request.getData())
-                .style(request.getStyle())
-                .transform(request.getTransform())
+                .data(jsonNodeToString(request.getData()))
+                .style(jsonNodeToString(request.getStyle()))
+                .transform(jsonNodeToString(request.getTransform()))
                 .build();
+    }
+
+    /**
+     * Convert JsonNode to JSON String for database storage.
+     * Returns "{}" for null values.
+     */
+    private String jsonNodeToString(JsonNode jsonNode) {
+        try {
+            return jsonNode == null ? "{}" : objectMapper.writeValueAsString(jsonNode);
+        } catch (Exception e) {
+            return "{}";
+        }
     }
 
     private Element getActiveElement(UUID id) {
@@ -178,9 +204,9 @@ public class ElementService {
             UUID projectId,
             UUID userId,
             ElementType type,
-            JsonNode data,
-            JsonNode style,
-            JsonNode transform
+            String data,
+            String style,
+            String transform
     ) {
         if (projectId != null) {
             element.setProject(projectService.getProjectEntity(projectId));
@@ -191,15 +217,10 @@ public class ElementService {
         if (type != null) {
             element.setType(type);
         }
-        if (data != null) {
-            element.setData(data);
-        }
-        if (style != null) {
-            element.setStyle(style);
-        }
-        if (transform != null) {
-            element.setTransform(transform);
-        }
+        // Always set data, style, transform - use empty JSON object if null
+        element.setData(data != null ? data : "{}");
+        element.setStyle(style != null ? style : "{}");
+        element.setTransform(transform != null ? transform : "{}");
     }
 
     private ElementResponse toResponse(Element element) {
@@ -210,10 +231,23 @@ public class ElementService {
                 .type(element.getType())
                 .data(element.getData())
                 .style(element.getStyle())
-                .transform(element.getTransform())
+                .transform(element.getTransform() == null ? "{}" : element.getTransform())
                 .version(element.getVersion())
                 .createdAt(element.getCreatedAt())
                 .updatedAt(element.getUpdatedAt())
                 .build();
     }
+
+    /**
+     * Convert object to JSON String for database storage.
+     * Returns "{}" for null values.
+     */
+    private String toJsonString(Object obj) {
+        try {
+            return obj == null ? "{}" : objectMapper.writeValueAsString(obj);
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
 }

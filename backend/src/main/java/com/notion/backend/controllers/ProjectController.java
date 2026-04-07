@@ -1,5 +1,7 @@
 package com.notion.backend.controllers;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.notion.backend.dtos.ApiResponse;
 import com.notion.backend.dtos.request.CreateProjectRequest;
 import com.notion.backend.dtos.response.CreateProjectResponse;
@@ -41,11 +43,10 @@ public class ProjectController {
 
     @GetMapping("/{id}")
     public ResponseEntity<ApiResponse<ProjectResponse>> getProject(@PathVariable UUID id) {
-        ProjectResponse response = projectService.getProject(id);
         return ResponseEntity.ok(ApiResponse.<ProjectResponse>builder()
                 .success(true)
                 .message("Project retrieved")
-                .data(response)
+                .data(projectService.getProject(id))
                 .build());
     }
 

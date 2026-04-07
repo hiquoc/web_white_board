@@ -11,5 +11,6 @@ public enum ElementType {
     LINE,
     TEXT,
     SHAPE,
-    IMAGE
+    IMAGE,
+    UNKNOWN;
 }

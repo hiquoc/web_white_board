@@ -1,6 +1,5 @@
 package com.notion.backend.dtos.response;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.notion.backend.enums.ElementType;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -21,9 +20,9 @@ public class ElementResponse {
     private UUID projectId;
     private UUID userId;
     private ElementType type;
-    private JsonNode data;
-    private JsonNode style;
-    private JsonNode transform;
+    private String data;
+    private String style;
+    private String transform;
     private Long version;
     private Instant createdAt;
     private Instant updatedAt;

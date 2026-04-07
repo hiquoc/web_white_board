@@ -1,7 +1,7 @@
 package com.notion.backend.models;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.notion.backend.enums.ElementType;
+import jakarta.persistence.Index;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
@@ -13,7 +13,9 @@ import java.time.Instant;
 import java.util.UUID;
 
 @Entity
-@Table(name = "elements")
+@Table(name = "elements", indexes = {
+        @Index(name = "idx_elements_project_id", columnList = "project_id")
+})
 @Getter
 @Setter
 @AllArgsConstructor
@@ -36,15 +38,15 @@ public class Element {
 
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
-    private JsonNode data;
+    private String data;
 
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
-    private JsonNode style;
+    private String style;
 
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
-    private JsonNode transform;
+    private String transform;
 
     @Version
     private Long version;

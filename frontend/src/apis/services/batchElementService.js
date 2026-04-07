@@ -36,6 +36,20 @@ import api from '../api'
  */
 
 /**
+ * Sanitize element to ensure all JSON fields are valid objects
+ * Prevents Spring Boot deserialization errors with JsonNode fields
+ * 
+ * @param {ElementOperation} element - Element to sanitize
+ * @returns {ElementOperation} Sanitized element with valid JSON objects
+ */
+const sanitizeElement = (element) => ({
+    ...element,
+    data: element.data ?? {},
+    style: element.style ?? {},
+    transform: element.transform ?? {}
+})
+
+/**
  * Perform a batch update of elements in a single request
  * This API consolidates create, update, and delete operations into one call
  * 
@@ -82,10 +96,17 @@ import api from '../api'
  * ])
  */
 export const batchUpdateElements = async (projectId, elements) => {
-    const response = await api.post(`/elements/batch`, {
+    // Sanitize all elements to ensure valid JSON for Spring Boot deserialization
+    const sanitizedElements = elements.map(sanitizeElement)
+    
+    const payload = {
         projectId,
-        elements
-    })
+        elements: sanitizedElements
+    }
+    
+    console.log('Batch updating elements:', payload)
+    
+    const response = await api.post(`/elements/batch`, payload)
     return response.data
 }
 
@@ -93,6 +114,7 @@ export const batchUpdateElements = async (projectId, elements) => {
  * Helper function to create a create operation for an element
  * 
  * @param {Object} params - Element parameters
+ * @param {string} params.id - Element ID (optional, will generate if not provided)
  * @param {string} params.userId - User ID
  * @param {string} params.projectId - Project ID
  * @param {string} params.type - Element type
@@ -101,8 +123,8 @@ export const batchUpdateElements = async (projectId, elements) => {
  * @param {Object} params.transform - Element transform
  * @returns {ElementOperation} Create operation
  */
-export const createCreateOperation = ({ userId, projectId, type, data, style, transform }) => ({
-    id: crypto.randomUUID(),
+export const createCreateOperation = ({ id, userId, projectId, type, data, style, transform }) => ({
+    id: id || crypto.randomUUID(),
     userId,
     projectId,
     type,
@@ -110,7 +132,7 @@ export const createCreateOperation = ({ userId, projectId, type, data, style, tr
     style,
     transform,
     version: 0,
-    updateType: 'create'
+    updateType: 'CREATE'
 })
 
 /**
@@ -136,7 +158,7 @@ export const createUpdateOperation = ({ id, userId, projectId, type, data, style
     style,
     transform,
     version: version + 1,
-    updateType: 'update'
+    updateType: 'UPDATE'
 })
 
 /**
@@ -159,5 +181,5 @@ export const createDeleteOperation = ({ id, userId, projectId, type, version }) 
     style: {},
     transform: {},
     version,
-    updateType: 'delete'
+    updateType: 'DELETE'
 })

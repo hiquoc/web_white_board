@@ -106,6 +106,7 @@ public class ElementController {
     public ResponseEntity<ApiResponse<BatchUpdateElementsResponse>> batchUpdateElements(
             @Valid @RequestBody BatchUpdateElementsRequest request
     ) {
+//        System.out.println(request.getElements().size());
         BatchUpdateElementsResponse response = elementService.batchUpdateElements(request);
         return ResponseEntity.ok(ApiResponse.<BatchUpdateElementsResponse>builder()
                 .success(true)

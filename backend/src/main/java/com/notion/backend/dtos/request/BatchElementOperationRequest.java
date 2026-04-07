@@ -9,6 +9,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -32,15 +33,14 @@ public class BatchElementOperationRequest {
     
     @NotNull
     private ElementType type;
-    
+
     @NotNull
-    private JsonNode data;
-    
+    private Map<String, Object> data;
+
     @NotNull
-    private JsonNode style;
-    
-    @NotNull
-    private JsonNode transform;
+    private Map<String, Object> style;
+
+    private Map<String, Object> transform;
     
     private Long version;
     

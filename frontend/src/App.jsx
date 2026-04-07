@@ -41,6 +41,7 @@ const WORLD_GRID_SIZE = 32
 const WORLD_MAJOR_GRID_SIZE = WORLD_GRID_SIZE * 4
 const SHAPE_DRAG_THRESHOLD = 4
 const MIN_POINT_ERASER_SIZE = 4
+const AUTO_SYNC_DEBOUNCE_MS = 2500
 function App() {
     const containerRef = useRef(null)
     const canvasRef = useRef(null)
@@ -103,6 +104,7 @@ function App() {
     const [selectedTextId, setSelectedTextId] = useState(null)
     const [selectedShapeId, setSelectedShapeId] = useState(null)
     const [editingText, setEditingText] = useState(null)
+    const [pendingSyncTick, setPendingSyncTick] = useState(0)
 
     const [historyIndex, setHistoryIndex] = useState(-1)
 
@@ -151,18 +153,20 @@ function App() {
         shouldUseFollowCursor
     })
 
-    // Refs for tracking element changes for auto-sync
-    const pendingElementChangesRef = useRef(new Map())
-    const autoSyncTimeoutRef = useRef(null)
-    const syncedElementsRef = useRef(new Map())
-    const isInitializedRef = useRef(false)
+    // Update source types for clean separation of concerns
+    const SOURCE = {
+        LOCAL: 'local',
+        REMOTE: 'remote',
+        LOAD: 'load'
+    }
 
-    // DEV-ONLY: Run self-test on startup to verify backend integration
-    // useEffect(() => {
-    //     if (import.meta.env.DEV) {
-    //         runDevSelfTest()
-    //     }
-    // }, [])
+    // Refs for tracking element changes for auto-sync (delta-based)
+    const autoSyncTimeoutRef = useRef(null)
+    const syncedElementsRef = useRef(new Map()) // id -> version
+    const isInitializedRef = useRef(false)
+    const pendingLocalUpdatesRef = useRef(new Map()) // id -> latest local change or delete tombstone
+    const processEraseQueueRef = useRef(() => {})
+
 
     const hasInit = useRef(false);
     useEffect(() => {
@@ -192,17 +196,25 @@ function App() {
 
                 if (response.success && response.data) {
                     setBoardName(response.data.title || boardName);
+                    
+                    // Mark as initialized BEFORE loading elements to prevent sync
+                    isInitializedRef.current = true;
+                    
+                    // Load elements from the project response (new combined API)
+                    if (response.data.elements && response.data.elements.length > 0) {
+                        loadElementsFromProject(response.data.elements);
+                    }
                 } else {
                     await createProject({
                         projectId: finalProjectId,
                         title: boardName
                     });
                 }
+                console.log(response);
             } catch (err) {
                 console.error('Init project failed:', err);
+                isInitializedRef.current = true;
             }
-
-            isInitializedRef.current = true;
         };
 
         const token = localStorage.getItem('token');
@@ -383,7 +395,7 @@ function App() {
 
         function loop() {
             if (!running) return
-            processEraseQueue()
+            processEraseQueueRef.current()
             requestAnimationFrame(loop)
         }
 
@@ -398,160 +410,50 @@ function App() {
     }, [shouldUseFollowCursor])
 
     // Element auto-sync: Send changes to backend after user stops interacting (debounced)
+    // Uses delta-based updates from pending queues instead of full state scanning
     useEffect(() => {
-        if (!projectId || !userId || !isInitializedRef.current) return
+        if (!isInitializedRef.current) return
 
-        // Clear existing timeout
-        if (autoSyncTimeoutRef.current) {
-            clearTimeout(autoSyncTimeoutRef.current)
+        // Only sync if there are pending local updates
+        if (pendingLocalUpdatesRef.current.size === 0) {
+            return
         }
 
-        // Debounce for 2.5 seconds after last change
+        clearAutoSyncTimeout()
+
+        // Keep the first server sync fast so follow-up eraser actions can target
+        // already-versioned elements instead of collapsing into create-only drafts.
         autoSyncTimeoutRef.current = setTimeout(async () => {
+            const { pendingUpdatesMap, pendingUpdates } = drainPendingUpdates()
+
+            console.log("Sending batch update:", pendingUpdates.length, "pending element changes")
+
             try {
-                const currentStrokes = strokesRef.current
-                const currentShapes = shapesRef.current
-                const currentTexts = textsRef.current
-
-                // Build element operations based on changes
-                const operations = []
-                const currentElementIds = new Set()
-
-                // Process strokes
-                currentStrokes.forEach(stroke => {
-                    const id = stroke.id
-                    currentElementIds.add(id)
-                    const syncedVersion = syncedElementsRef.current.get(id)
-
-                    if (!syncedVersion) {
-                        // New element - create
-                        operations.push(createCreateOperation({
-                            userId,
-                            projectId,
-                            type: 'STROKE',
-                            data: { points: stroke.points || [] },
-                            style: { color: stroke.color, width: stroke.width, opacity: stroke.opacity || 1 },
-                            transform: {}
-                        }))
-                        // Override the generated id with the actual stroke id
-                        operations[operations.length - 1].id = id
-                    } else {
-                        // Existing element - check if changed
-                        operations.push(createUpdateOperation({
-                            id,
-                            userId,
-                            projectId,
-                            type: 'STROKE',
-                            data: { points: stroke.points || [] },
-                            style: { color: stroke.color, width: stroke.width, opacity: stroke.opacity || 1 },
-                            transform: {},
-                            version: syncedVersion
-                        }))
-                    }
-                })
-
-                // Process shapes
-                currentShapes.forEach(shapeItem => {
-                    const id = shapeItem.id
-                    currentElementIds.add(id)
-                    const syncedVersion = syncedElementsRef.current.get(id)
-
-                    if (!syncedVersion) {
-                        // New element - create
-                        operations.push(createCreateOperation({
-                            userId,
-                            projectId,
-                            type: shapeItem.type?.toUpperCase() || 'RECTANGLE',
-                            data: {},
-                            style: { color: shapeItem.color, strokeWidth: shapeItem.strokeWidth },
-                            transform: { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height }
-                        }))
-                        operations[operations.length - 1].id = id
-                    } else {
-                        // Existing element - update
-                        operations.push(createUpdateOperation({
-                            id,
-                            userId,
-                            projectId,
-                            type: shapeItem.type?.toUpperCase() || 'RECTANGLE',
-                            data: {},
-                            style: { color: shapeItem.color, strokeWidth: shapeItem.strokeWidth },
-                            transform: { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height },
-                            version: syncedVersion
-                        }))
-                    }
-                })
-
-                // Process texts
-                currentTexts.forEach(textItem => {
-                    const id = textItem.id
-                    currentElementIds.add(id)
-                    const syncedVersion = syncedElementsRef.current.get(id)
-
-                    if (!syncedVersion) {
-                        // New element - create
-                        operations.push(createCreateOperation({
-                            userId,
-                            projectId,
-                            type: 'TEXT',
-                            data: { text: textItem.text || '' },
-                            style: { color: textItem.color, fontSize: textItem.fontSize },
-                            transform: { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height }
-                        }))
-                        operations[operations.length - 1].id = id
-                    } else {
-                        // Existing element - update
-                        operations.push(createUpdateOperation({
-                            id,
-                            userId,
-                            projectId,
-                            type: 'TEXT',
-                            data: { text: textItem.text || '' },
-                            style: { color: textItem.color, fontSize: textItem.fontSize },
-                            transform: { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height },
-                            version: syncedVersion
-                        }))
-                    }
-                })
-
-                // Check for deleted elements
-                syncedElementsRef.current.forEach((version, id) => {
-                    if (!currentElementIds.has(id)) {
-                        // Element was deleted
-                        operations.push(createDeleteOperation({
-                            id,
-                            userId,
-                            projectId,
-                            type: 'UNKNOWN',
-                            version: version
-                        }))
-                        syncedElementsRef.current.delete(id)
-                    }
-                })
+                const operations = buildBatchOperations(pendingUpdates)
 
                 if (operations.length === 0) return
 
                 const response = await batchUpdateElements(projectId, operations)
 
-                if (response.success && response.data) {
-                    // Update synced versions for created/updated elements
-                    if (response.data.elements) {
-                        response.data.elements.forEach(element => {
-                            syncedElementsRef.current.set(element.id, element.version)
-                        })
-                    }
+                if (response.success) {
+                    removeDeletedSyncedElements(pendingUpdates)
+                }
+
+                if (response.success && response.data?.elements) {
+                    updateSyncedElementVersions(response.data.elements)
                 }
             } catch (err) {
                 console.error('Failed to sync elements:', err)
+
+                // Restore pending changes so they can be retried by the next debounce cycle.
+                restorePendingUpdates(pendingUpdatesMap)
             }
-        }, 2500)
+        }, AUTO_SYNC_DEBOUNCE_MS)
 
         return () => {
-            if (autoSyncTimeoutRef.current) {
-                clearTimeout(autoSyncTimeoutRef.current)
-            }
+            clearAutoSyncTimeout()
         }
-    }, [strokes, shapes, texts, projectId, userId])
+    }, [strokes, shapes, texts, projectId, userId, pendingSyncTick])
 
     function normalizeLayerOrder(nextStrokes, nextShapes, nextTexts, nextLayerOrder = layerOrderRef.current) {
         const strokeIds = new Set(nextStrokes.map(stroke => stroke.id))
@@ -610,7 +512,263 @@ function App() {
         setHistoryIndex(trimmedHistory.length - 1)
     }
 
+    function createStrokeSyncElement(stroke) {
+        return {
+            id: stroke.id,
+            type: 'STROKE',
+            data: { points: stroke.points || [] },
+            style: { color: stroke.color, width: stroke.width, opacity: stroke.opacity ?? 1 },
+            transform: {}
+        }
+    }
+
+    function createShapeSyncElement(shape) {
+        return {
+            id: shape.id,
+            type: (shape.type || 'rectangle').toUpperCase(),
+            data: {},
+            style: { color: shape.color, strokeWidth: shape.strokeWidth },
+            transform: { x: shape.x, y: shape.y, width: shape.width, height: shape.height }
+        }
+    }
+
+    function createTextSyncElement(text) {
+        return {
+            id: text.id,
+            type: 'TEXT',
+            data: { text: text.text || '' },
+            style: { color: text.color, fontSize: text.fontSize },
+            transform: { x: text.x, y: text.y, width: text.width, height: text.height }
+        }
+    }
+
+    function areObjectsEqual(first = {}, second = {}) {
+        const firstEntries = Object.entries(first)
+        const secondEntries = Object.entries(second)
+
+        if (firstEntries.length !== secondEntries.length) {
+            return false
+        }
+
+        return firstEntries.every(([key, value]) => {
+            const otherValue = second[key]
+
+            if (Array.isArray(value) || (value && typeof value === 'object')) {
+                return JSON.stringify(value) === JSON.stringify(otherValue)
+            }
+
+            return value === otherValue
+        })
+    }
+
+    function areSyncElementsEqual(previousElement, nextElement) {
+        if (!previousElement || !nextElement) return false
+
+        return (
+            previousElement.type === nextElement.type &&
+            areObjectsEqual(previousElement.data, nextElement.data) &&
+            areObjectsEqual(previousElement.style, nextElement.style) &&
+            areObjectsEqual(previousElement.transform, nextElement.transform)
+        )
+    }
+
+    function hasMeaningfulTransformChange(previousTransform = {}, nextTransform = {}) {
+        return (
+            previousTransform.x !== nextTransform.x ||
+            previousTransform.y !== nextTransform.y ||
+            previousTransform.width !== nextTransform.width ||
+            previousTransform.height !== nextTransform.height
+        )
+    }
+
+    function clearAutoSyncTimeout() {
+        if (autoSyncTimeoutRef.current) {
+            clearTimeout(autoSyncTimeoutRef.current)
+        }
+    }
+
+    function drainPendingUpdates() {
+        const pendingUpdatesMap = new Map(pendingLocalUpdatesRef.current)
+        const pendingUpdates = Array.from(pendingUpdatesMap.values())
+        pendingLocalUpdatesRef.current = new Map()
+
+        return { pendingUpdatesMap, pendingUpdates }
+    }
+
+    function createPendingSyncElement(element) {
+        return {
+            id: element.id,
+            userId,
+            projectId,
+            type: element.type,
+            data: element.data,
+            style: element.style,
+            transform: element.transform
+        }
+    }
+
+    function buildBatchOperation(element) {
+        const version = syncedElementsRef.current.get(element.id)
+
+        if (element.deleted) {
+            if (version === undefined) {
+                return null
+            }
+
+            return createDeleteOperation({
+                id: element.id,
+                userId: element.userId,
+                projectId: element.projectId,
+                type: element.type,
+                version
+            })
+        }
+
+        if (version === undefined) {
+            return createCreateOperation({
+                ...element,
+                version: 0
+            })
+        }
+
+        return createUpdateOperation({
+            ...element,
+            version
+        })
+    }
+
+    function buildBatchOperations(pendingUpdates) {
+        return pendingUpdates.reduce((operations, element) => {
+            const operation = buildBatchOperation(element)
+            if (operation) {
+                operations.push(operation)
+            }
+            return operations
+        }, [])
+    }
+
+    function removeDeletedSyncedElements(pendingUpdates) {
+        pendingUpdates.forEach(element => {
+            if (element.deleted) {
+                syncedElementsRef.current.delete(element.id)
+            }
+        })
+    }
+
+    function updateSyncedElementVersions(elements) {
+        // Update synced versions for created/updated elements
+        elements.forEach(element => {
+            syncedElementsRef.current.set(element.id, element.version)
+        })
+    }
+
+    function restorePendingUpdates(pendingUpdatesMap) {
+        pendingUpdatesMap.forEach((element, id) => {
+            pendingLocalUpdatesRef.current.set(id, element)
+        })
+    }
+
+    /**
+     * Enqueue an element update for batch sync (delta-based)
+     * Overwrites old updates for the same element to prevent duplicates
+     */
+    const enqueueElementUpdate = (element) => {
+        if (!isInitializedRef.current) return // Don't enqueue during initial load
+        if (!userId || !projectId) return // Don't enqueue if user/project not initialized
+        console.log("Enqueue update for element:", element.id)
+
+        const syncedVersion = syncedElementsRef.current.get(element.id)
+        const existingPendingElement = pendingLocalUpdatesRef.current.get(element.id)
+        if (existingPendingElement?.deleted) {
+            return
+        }
+
+        const updateData = createPendingSyncElement(element)
+
+        if (areSyncElementsEqual(existingPendingElement, updateData)) {
+            return
+        }
+
+        // Unsynced elements are still local drafts, so keep folding later
+        // changes into the eventual CREATE payload instead of emitting UPDATEs.
+        if (syncedVersion === undefined) {
+            pendingLocalUpdatesRef.current.set(element.id, updateData)
+            setPendingSyncTick(tick => tick + 1)
+            return
+        }
+
+        pendingLocalUpdatesRef.current.set(element.id, updateData)
+        setPendingSyncTick(tick => tick + 1)
+    }
+
+    /**
+     * Enqueue an element deletion for batch sync.
+     * Stores a delete marker in the main pending updates queue and keeps the
+     * delete id list deduped for operation building.
+     */
+    const enqueueElementDelete = (element) => {
+        if (!isInitializedRef.current) return // Don't enqueue during initial load
+        if (!userId || !projectId) return // Don't enqueue if user/project not initialized
+
+        console.log("Enqueue delete for element:", element.id)
+        const syncedVersion = syncedElementsRef.current.get(element.id)
+        if (syncedVersion === undefined) {
+            // CREATE + DELETE before first sync should collapse to a local no-op.
+            if (pendingLocalUpdatesRef.current.delete(element.id)) {
+                console.log("Collapsed pending create + delete for element:", element.id)
+                setPendingSyncTick(tick => tick + 1)
+            }
+            return
+        }
+
+        const deleteMarker = {
+            id: element.id,
+            userId,
+            projectId,
+            type: element.type,
+            data: element.data,
+            style: element.style,
+            transform: element.transform,
+            deleted: true,
+            deletedAt: new Date().toISOString()
+        }
+
+        pendingLocalUpdatesRef.current.set(element.id, deleteMarker)
+        setPendingSyncTick(tick => tick + 1)
+    }
+
     function applyBoardState(nextStrokes, nextShapes, nextTexts, options = {}) {
+        if (isInitializedRef.current) {
+            const previousElements = new Map([
+                ...strokesRef.current.map(stroke => [stroke.id, createStrokeSyncElement(stroke)]),
+                ...shapesRef.current.map(shape => [shape.id, createShapeSyncElement(shape)]),
+                ...textsRef.current.map(text => [text.id, createTextSyncElement(text)])
+            ])
+            const nextElementIds = new Set([
+                ...nextStrokes.map(stroke => stroke.id),
+                ...nextShapes.map(shape => shape.id),
+                ...nextTexts.map(text => text.id)
+            ])
+            const nextElements = new Map([
+                ...nextStrokes.map(stroke => [stroke.id, createStrokeSyncElement(stroke)]),
+                ...nextShapes.map(shape => [shape.id, createShapeSyncElement(shape)]),
+                ...nextTexts.map(text => [text.id, createTextSyncElement(text)])
+            ])
+
+            previousElements.forEach((element, id) => {
+                if (!nextElementIds.has(id)) {
+                    enqueueElementDelete(element)
+                }
+            })
+
+            nextElements.forEach((element, id) => {
+                const previousElement = previousElements.get(id)
+                if (!previousElement || !areSyncElementsEqual(previousElement, element)) {
+                    enqueueElementUpdate(element)
+                }
+            })
+        }
+
         const nextLayerOrder = normalizeLayerOrder(
             nextStrokes,
             nextShapes,
@@ -978,18 +1136,36 @@ function App() {
                 if (textItem.id !== drag.textId) return textItem
 
                 if (drag.mode === 'move') {
-                    return {
+                    const movedText = {
                         ...textItem,
                         x: pos.x - drag.offsetX,
                         y: pos.y - drag.offsetY
                     }
+
+                    if (hasMeaningfulTransformChange(
+                        { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height },
+                        { x: movedText.x, y: movedText.y, width: movedText.width, height: movedText.height }
+                    )) {
+                        enqueueElementUpdate(createTextSyncElement(movedText))
+                    }
+
+                    return movedText
                 }
 
-                return {
+                const resizedText = {
                     ...textItem,
                     width: Math.max(120, drag.startWidth + (pos.x - drag.startPointer.x)),
                     height: Math.max(60, drag.startHeight + (pos.y - drag.startPointer.y))
                 }
+
+                if (hasMeaningfulTransformChange(
+                    { x: textItem.x, y: textItem.y, width: textItem.width, height: textItem.height },
+                    { x: resizedText.x, y: resizedText.y, width: resizedText.width, height: resizedText.height }
+                )) {
+                    enqueueElementUpdate(createTextSyncElement(resizedText))
+                }
+
+                return resizedText
             })
 
             textsRef.current = nextTexts
@@ -1005,18 +1181,36 @@ function App() {
                 if (shapeItem.id !== drag.shapeId) return shapeItem
 
                 if (drag.mode === 'move') {
-                    return {
+                    const movedShape = {
                         ...shapeItem,
                         x: pos.x - drag.offsetX,
                         y: pos.y - drag.offsetY
                     }
+
+                    if (hasMeaningfulTransformChange(
+                        { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height },
+                        { x: movedShape.x, y: movedShape.y, width: movedShape.width, height: movedShape.height }
+                    )) {
+                        enqueueElementUpdate(createShapeSyncElement(movedShape))
+                    }
+
+                    return movedShape
                 }
 
-                return {
+                const resizedShape = {
                     ...shapeItem,
                     width: Math.max(SHAPE_MIN_SIZE, drag.startWidth + (pos.x - drag.startPointer.x)),
                     height: Math.max(SHAPE_MIN_SIZE, drag.startHeight + (pos.y - drag.startPointer.y))
                 }
+
+                if (hasMeaningfulTransformChange(
+                    { x: shapeItem.x, y: shapeItem.y, width: shapeItem.width, height: shapeItem.height },
+                    { x: resizedShape.x, y: resizedShape.y, width: resizedShape.width, height: resizedShape.height }
+                )) {
+                    enqueueElementUpdate(createShapeSyncElement(resizedShape))
+                }
+
+                return resizedShape
             })
 
             shapesRef.current = nextShapes
@@ -1056,6 +1250,8 @@ function App() {
             const nextLayerOrder = draft.created
                 ? layerOrderRef.current
                 : [...layerOrderRef.current, { type: 'shape', id: draft.id }]
+
+            enqueueElementUpdate(createShapeSyncElement(nextShape))
 
             shapesRef.current = nextShapes
             layerOrderRef.current = nextLayerOrder
@@ -1145,10 +1341,10 @@ function App() {
             return
         }
 
-        if (currentTool === 'point-eraser') {
+        if (currentTool === 'eraser' || currentTool === 'point-eraser') {
             processEraseQueue()
 
-            if (pointEraseDirtyRef.current) {
+            if (currentTool === 'point-eraser' && pointEraseDirtyRef.current) {
                 commitHistory(strokesRef.current, shapesRef.current, textsRef.current)
                 pointEraseDirtyRef.current = false
             }
@@ -1308,6 +1504,32 @@ function App() {
         return { segments, changed: true }
     }
 
+    function enqueueEraseChanges(previousStrokes, previousShapes, previousTexts, nextStrokes, nextShapes, nextTexts) {
+        const previousElements = createBoardSyncElementMap(previousStrokes, previousShapes, previousTexts)
+        const nextElements = createBoardSyncElementMap(nextStrokes, nextShapes, nextTexts)
+
+        previousElements.forEach((element, id) => {
+            if (!nextElements.has(id)) {
+                enqueueElementDelete(element)
+            }
+        })
+
+        nextElements.forEach((element, id) => {
+            const previousElement = previousElements.get(id)
+            if (!previousElement || !areSyncElementsEqual(previousElement, element)) {
+                enqueueElementUpdate(element)
+            }
+        })
+    }
+
+    function createBoardSyncElementMap(strokesList, shapesList, textsList) {
+        return new Map([
+            ...strokesList.map(stroke => [stroke.id, createStrokeSyncElement(stroke)]),
+            ...shapesList.map(shape => [shape.id, createShapeSyncElement(shape)]),
+            ...textsList.map(text => [text.id, createTextSyncElement(text)])
+        ])
+    }
+
     function processEraseQueue() {
         const queue = eraseQueueRef.current
         if (queue.length === 0) return
@@ -1371,16 +1593,28 @@ function App() {
 
         if (!hasChanges) return
 
+        enqueueEraseChanges(
+            strokesRef.current,
+            shapesRef.current,
+            textsRef.current,
+            nextStrokes,
+            nextShapes,
+            nextTexts
+        )
+
         if (tool === 'point-eraser') {
             pointEraseDirtyRef.current = true
             applyBoardState(nextStrokes, nextShapes, nextTexts, { layerOrder: nextLayerOrder })
             return
         }
 
-        if (isHoldingMouseDown.current) {
-            applyBoardState(nextStrokes, nextShapes, nextTexts, { commitHistory: true, layerOrder: nextLayerOrder })
-        }
+        applyBoardState(nextStrokes, nextShapes, nextTexts, {
+            commitHistory: isHoldingMouseDown.current,
+            layerOrder: nextLayerOrder
+        })
     }
+
+    processEraseQueueRef.current = processEraseQueue
 
     function isNear(point, queue, threshold) {
         const t2 = threshold * threshold
@@ -1838,6 +2072,105 @@ function App() {
         setSelectedTextId(null)
         setSelectedShapeId(null)
         setEditingText(null)
+    }
+
+    /**
+     * Parse JSON string to object, handling both string and object inputs
+     * @param {string|object} value - Value to parse
+     * @returns {object} Parsed object or empty object if invalid
+     */
+    function parseJsonString(value) {
+        if (typeof value === 'string') {
+            try {
+                return JSON.parse(value)
+            } catch (e) {
+                console.error('Failed to parse JSON string:', value)
+                return {}
+            }
+        }
+        return value || {}
+    }
+
+    /**
+     * Load elements from project API response into the whiteboard state
+     * Converts backend element format to frontend format and initializes sync tracking
+     * @param {Array} elements - Array of element responses from backend
+     */
+    function loadElementsFromProject(elements) {
+        const loadedStrokes = []
+        const loadedShapes = []
+        const loadedTexts = []
+
+        elements.forEach(element => {
+            const { id, type, data, style, transform, version } = element
+            // Parse string data to objects (backend sends JSON strings)
+            const parsedData = parseJsonString(data)
+            const parsedStyle = parseJsonString(style)
+            const parsedTransform = parseJsonString(transform)
+            
+            // Track this element as synced with its version
+            syncedElementsRef.current.set(id, version)
+
+            switch (type?.toUpperCase()) {
+                case 'STROKE': {
+                    const points = parsedData?.points || []
+                    if (points.length > 0) {
+                        loadedStrokes.push({
+                            id,
+                            color: parsedStyle?.color || '#111827',
+                            width: parsedStyle?.width || 3,
+                            opacity: parsedStyle?.opacity ?? 1,
+                            points
+                        })
+                    }
+                    break
+                }
+                case 'TEXT': {
+                    const text = parsedData?.text || ''
+                    loadedTexts.push({
+                        id,
+                        text,
+                        x: parsedTransform?.x || 0,
+                        y: parsedTransform?.y || 0,
+                        width: parsedTransform?.width || 200,
+                        height: parsedTransform?.height || 60,
+                        color: parsedStyle?.color || '#111827',
+                        fontSize: parsedStyle?.fontSize || DEFAULT_TEXT_FONT_SIZE
+                    })
+                    break
+                }
+                case 'RECTANGLE':
+                case 'CIRCLE':
+                case 'DIAMOND':
+                case 'ARROW': {
+                    const shapeType = type.toLowerCase()
+                    loadedShapes.push({
+                        id,
+                        type: shapeType,
+                        x: parsedTransform?.x || 0,
+                        y: parsedTransform?.y || 0,
+                        width: parsedTransform?.width || 100,
+                        height: parsedTransform?.height || 100,
+                        color: parsedStyle?.color || '#111827',
+                        strokeWidth: parsedStyle?.strokeWidth || 2
+                    })
+                    break
+                }
+                default:
+                    console.warn('Unknown element type:', type)
+            }
+        })
+
+        // Apply loaded elements to the board
+        if (loadedStrokes.length > 0 || loadedShapes.length > 0 || loadedTexts.length > 0) {
+            applyBoardState(
+                loadedStrokes,
+                loadedShapes,
+                loadedTexts,
+                { commitHistory: true }
+            )
+            console.log(`Loaded ${elements.length} elements from project`)
+        }
     }
 
     function exportBoard() {
